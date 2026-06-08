@@ -1,0 +1,327 @@
+import { Router } from 'express';
+import { authenticate } from '../middleware/auth.js';
+import { parseAndValidateInt, parseAndValidateFloat } from '../utils/validation.js';
+import { validateBody } from '../middleware/validate.js';
+import { depositSchema } from '../utils/schemas.js';
+
+const router = Router();
+router.use(authenticate);
+
+
+router.get('/', async (req, res, next) => {
+  try {
+    const { walletId, type, limit, offset } = req.query;
+
+    const where = {};
+
+    
+    const limitVal = parseAndValidateInt(limit, 'limit', false, 1) || 50;
+    const offsetVal = parseAndValidateInt(offset, 'offset', false, 0) || 0;
+
+    
+    const userWallets = await req.prisma.wallet.findMany({
+      where: { userId: req.user.id },
+      select: { id: true },
+    });
+    const walletIds = userWallets.map(w => w.id);
+    where.walletId = { in: walletIds };
+
+    if (walletId) {
+      if (!walletIds.includes(walletId)) {
+        return res.status(403).json({ error: 'Access denied.' });
+      }
+      where.walletId = walletId;
+    }
+
+    if (type) {
+      const allowedTypes = ['DEPOSIT', 'WITHDRAWAL', 'PURCHASE', 'TRANSFER'];
+      const typeUpper = type.toUpperCase();
+      if (!allowedTypes.includes(typeUpper)) {
+        return res.status(400).json({ error: `Invalid transaction type "${type}". Must be one of: ${allowedTypes.join(', ')}` });
+      }
+      where.type = typeUpper;
+    }
+
+    const [transactions, total] = await Promise.all([
+      req.prisma.transaction.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        take: limitVal,
+        skip: offsetVal,
+        include: { wallet: { select: { label: true } } },
+      }),
+      req.prisma.transaction.count({ where }),
+    ]);
+
+    res.json({ transactions, total, limit: limitVal, offset: offsetVal });
+  } catch (err) {
+    next(err);
+  }
+});
+
+
+router.post('/deposit', validateBody(depositSchema), async (req, res, next) => {
+  try {
+    const { walletId, amount, description, method, holidayId, idempotencyKey } = req.body;
+
+    const validatedAmount = parseAndValidateFloat(amount, 'amount', true, 0.01);
+
+    
+    if (validatedAmount < 100) {
+      return res.status(400).json({ error: 'Minimum deposit is 100 ETB.' });
+    }
+    if (validatedAmount > 25000) {
+      return res.status(400).json({ error: 'Maximum deposit is 25,000 ETB per transaction.' });
+    }
+
+    
+    const wallet = await req.prisma.wallet.findFirst({
+      where: { id: walletId, userId: req.user.id },
+    });
+
+    if (!wallet) {
+      return res.status(404).json({ error: 'Wallet not found.' });
+    }
+
+    console.log('Starting deposit transaction for wallet:', walletId);
+    const result = await req.prisma.$transaction(async (tx) => {
+      console.log('Transaction started');
+      
+      const existingKey = await tx.idempotencyKey.findUnique({
+        where: { key: idempotencyKey }
+      });
+      if (existingKey) {
+        throw new Error('Idempotency conflict: This transaction was already processed.');
+      }
+
+      
+      await tx.idempotencyKey.create({
+        data: {
+          key: idempotencyKey,
+          userId: req.user.id,
+          action: 'DEPOSIT',
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
+        }
+      });
+
+      
+      console.log('Skipping manual lock');
+
+      
+      const userRecord = await tx.user.findUnique({ where: { id: req.user.id } });
+      
+      
+      const kycLevel = userRecord.kycLevel || 'BASIC';
+      let limitForKyc = 5000;
+      if (kycLevel === 'STANDARD') limitForKyc = 20000;
+      else if (kycLevel === 'VERIFIED') limitForKyc = 25000;
+
+      if (validatedAmount > limitForKyc) {
+        throw new Error(`Deposit amount exceeds limit for your KYC level (${kycLevel}): Max ${limitForKyc} ETB.`);
+      }
+
+      
+      const now = new Date();
+      const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+      const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
+
+      const monthlyDeposits = await tx.transaction.aggregate({
+        where: {
+          wallet: { userId: req.user.id },
+          type: 'DEPOSIT',
+          createdAt: {
+            gte: startOfMonth,
+            lte: endOfMonth
+          }
+        },
+        _sum: {
+          amount: true
+        }
+      });
+      const monthlySum = (monthlyDeposits._sum.amount || 0) + validatedAmount;
+      if (monthlySum > 500000) {
+        throw new Error('Monthly deposit limit of 500,000 ETB exceeded.');
+      }
+
+      
+      let bonusAmount = 0;
+      let lockUntilDate = null;
+      let amountToLock = validatedAmount;
+      let amountToAvailable = 0;
+      let existingGoal = null;
+
+      if (holidayId) {
+        const holiday = await tx.holiday.findUnique({ where: { id: holidayId } });
+        if (!holiday || !holiday.isActive) {
+          throw new Error('Target holiday not found or inactive.');
+        }
+        lockUntilDate = holiday.deadline;
+
+        
+        existingGoal = await tx.customerHoliday.findUnique({
+          where: { userId_holidayId: { userId: req.user.id, holidayId } }
+        });
+
+        if (existingGoal) {
+          if (existingGoal.status === 'completed') {
+            
+            amountToLock = 0;
+            amountToAvailable = validatedAmount;
+          } else {
+            
+            const remaining = Math.max(0, existingGoal.targetAmount - existingGoal.currentAmount);
+            amountToLock = Math.min(validatedAmount, remaining);
+            amountToAvailable = validatedAmount - amountToLock;
+          }
+        } else {
+          
+          if (validatedAmount < holiday.minimumDeposit) {
+            throw new Error(`Initial deposit to set up this holiday goal must be at least ${holiday.minimumDeposit} ETB.`);
+          }
+        }
+
+        
+        const daysDiff = Math.ceil((lockUntilDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+        let bonusPercent = 0;
+        if (daysDiff >= 180) bonusPercent = 0.05;
+        else if (daysDiff >= 90) bonusPercent = 0.03;
+        else if (daysDiff >= 30) bonusPercent = 0.02;
+
+        bonusAmount = Math.round(amountToLock * bonusPercent);
+      }
+
+      
+      const walletDataUpdate = {};
+      if (holidayId && lockUntilDate) {
+        if (amountToLock > 0) {
+          walletDataUpdate.lockedBalance = { increment: amountToLock };
+          walletDataUpdate.platformCredits = { increment: bonusAmount };
+          walletDataUpdate.holidayId = holidayId;
+
+          if (!wallet.lockedUntil || lockUntilDate > wallet.lockedUntil) {
+            walletDataUpdate.lockedUntil = lockUntilDate;
+          }
+        }
+        if (amountToAvailable > 0) {
+          walletDataUpdate.balance = { increment: amountToAvailable };
+        }
+        
+        if (amountToLock === 0 && amountToAvailable === 0) {
+          walletDataUpdate.balance = { increment: validatedAmount };
+        }
+      } else {
+        walletDataUpdate.balance = { increment: validatedAmount };
+      }
+
+      console.log('Updating wallet balance...');
+      const updatedWallet = await tx.wallet.update({
+        where: { id: walletId },
+        data: walletDataUpdate,
+      });
+      console.log('Wallet balance updated');
+
+      
+      const txn = await tx.transaction.create({
+        data: {
+          walletId,
+          amount: validatedAmount,
+          type: 'DEPOSIT',
+          description: description || (holidayId ? 'Holiday Savings Locked Deposit' : 'Deposit'),
+          method: method || 'Telebirr',
+          holidayId: holidayId || null,
+          bonusAmount,
+          lockedUntil: amountToLock > 0 ? lockUntilDate : null,
+          balanceType: amountToLock > 0 ? 'LOCKED' : 'AVAILABLE',
+        },
+      });
+
+      
+      await tx.user.update({
+        where: { id: req.user.id },
+        data: {
+          totalDeposits: { increment: validatedAmount },
+        },
+      });
+
+      
+      if (holidayId) {
+        if (existingGoal && existingGoal.status !== 'completed') {
+          
+          const newAmount = existingGoal.currentAmount + amountToLock;
+          const status = newAmount >= existingGoal.targetAmount ? 'completed' : 'active';
+          await tx.customerHoliday.update({
+            where: { id: existingGoal.id },
+            data: { currentAmount: newAmount, status }
+          });
+        } else if (!existingGoal) {
+          
+          await tx.customerHoliday.create({
+            data: {
+              userId: req.user.id,
+              holidayId,
+              targetAmount: validatedAmount,
+              currentAmount: validatedAmount,
+              status: 'active'
+            }
+          });
+        }
+        
+      } else if (!wallet.isFamily) {
+        
+        const activeGoals = await tx.customerHoliday.findMany({
+          where: { userId: req.user.id, status: 'active' },
+          include: { holiday: true },
+          orderBy: { holiday: { deadline: 'asc' } },
+        });
+
+        if (activeGoals.length > 0) {
+          const earliest = activeGoals[0];
+          const newAmount = Math.min(earliest.currentAmount + validatedAmount, earliest.targetAmount);
+          const status = newAmount >= earliest.targetAmount ? 'completed' : 'active';
+          await tx.customerHoliday.update({
+            where: { id: earliest.id },
+            data: { currentAmount: newAmount, status },
+          });
+        }
+      }
+
+      
+      let notifMessage;
+      if (holidayId) {
+        if (amountToAvailable > 0 && amountToLock > 0) {
+          notifMessage = `${amountToLock.toLocaleString()} ETB locked for your goal (Bonus: ${bonusAmount.toLocaleString()} Credits). ${amountToAvailable.toLocaleString()} ETB added to available balance.`;
+        } else if (amountToLock === 0) {
+          notifMessage = `Goal already completed. ${validatedAmount.toLocaleString()} ETB added to your available balance.`;
+        } else {
+          notifMessage = `Your locked deposit of ${validatedAmount.toLocaleString()} ETB (Bonus: ${bonusAmount.toLocaleString()} Credits) has been locked until ${lockUntilDate.toLocaleDateString()}.`;
+        }
+      } else {
+        notifMessage = `Your deposit of ${validatedAmount.toLocaleString()} ETB via ${method || 'Telebirr'} has been confirmed.`;
+      }
+
+      const notification = await tx.notification.create({
+        data: {
+          userId: req.user.id,
+          title: holidayId ? 'Holiday Deposit ✓' : 'Deposit Confirmed ✓',
+          message: notifMessage,
+          type: 'DEPOSIT',
+        },
+      });
+
+      console.log('Deposit transaction complete');
+      return { wallet: updatedWallet, transaction: txn, notification };
+    }, {
+      maxWait: 15000,
+      timeout: 30000
+    });
+
+    res.status(201).json(result);
+  } catch (err) {
+    if (err.message.includes('exceeds') || err.message.includes('limit') || err.message.includes('inactive')) {
+      return res.status(400).json({ error: err.message });
+    }
+    next(err);
+  }
+});
+
+export default router;
